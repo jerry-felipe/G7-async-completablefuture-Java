@@ -846,6 +846,6 @@ It is:
 **Work Order IT**  
 Soluciones tecnológicas, arquitectura de software y formación técnica para equipos de desarrollo.
 
-Este repositorio forma parte de una iniciativa educativa orientada a explicar cómo la concurrencia en **Python 3.13** puede acelerar un sistema o volverlo impredecible cuando el estado compartido no se controla correctamente.
+Este repositorio forma parte de una iniciativa educativa orientada a explicar cómo la concurrencia en **Java 26** puede acelerar un sistema o volverlo impredecible cuando el estado compartido no se controla correctamente.
 
 Website: [www.workorder-it.net](https://www.workorder-it.net)
