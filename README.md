@@ -8,6 +8,8 @@ A simple Java project that demonstrates the difference between **blocking sequen
 
 The project processes three independent report-generation tasks and compares how execution time changes when those tasks are performed sequentially versus asynchronously.
 
+It then presents two additional flavors of the same solution using the most recent Java concurrency features: **virtual threads** and **structured concurrency**.
+
 ## Overview
 
 Applications frequently perform operations that spend significant time waiting, such as:
@@ -22,6 +24,8 @@ When independent operations are executed sequentially, each task must finish bef
 
 This project demonstrates how Java's `CompletableFuture` can be used to start independent tasks asynchronously, wait for them as a group, and reduce the overall elapsed time.
 
+It also shows how the same result can be achieved with **virtual threads** (Project Loom) and with **structured concurrency** (`StructuredTaskScope`), two newer approaches that keep the code readable while running tasks concurrently.
+
 ## Project Objective
 
 The objective is to demonstrate:
@@ -32,17 +36,29 @@ The objective is to demonstrate:
 4. How `CompletableFuture.allOf()` can coordinate multiple asynchronous operations.
 5. How `join()` can retrieve their results after completion.
 6. Why independent waiting operations should not necessarily be processed one after another.
+7. How **virtual threads** allow blocking-style code to run concurrently at very low cost.
+8. How **structured concurrency** binds the lifetime of concurrent tasks to a code block and handles failure and cancellation automatically.
 
 ## Project Structure
 
 ```text
-java-async-completablefuture/
+G7-async-completablefuture-Java/
+├── pom.xml
 └── src/
-    ├── BlockingProblem.java
-    └── NonBlockingSolution.java
+    └── main/
+        └── java/
+            ├── BlockingProblem.java
+            ├── NonBlockingSolution.java
+            ├── VirtualThreadsSolution.java
+            └── StructuredConcurrencySolution.java
 ```
 
-The project contains two implementations of the same report-processing scenario.
+The project is a standard Maven project and contains four implementations of the same report-processing scenario:
+
+1. `BlockingProblem` – sequential execution (the problem).
+2. `NonBlockingSolution` – asynchronous execution with `CompletableFuture`.
+3. `VirtualThreadsSolution` – concurrent execution with virtual threads.
+4. `StructuredConcurrencySolution` – concurrent execution with structured concurrency.
 
 ## 1. BlockingProblem
 
@@ -387,6 +403,260 @@ report3.join();
 
 The synchronization therefore occurs after the three independent tasks have already been started.
 
+## 3. Virtual Threads Solution
+
+The third implementation uses **virtual threads**, introduced as a final feature in Java 21.
+
+A virtual thread is a lightweight thread managed by the JVM rather than by the operating system. Creating one is so cheap that the application no longer needs to size a thread pool: it can simply create **one thread per task**.
+
+The executor is obtained with:
+
+```java
+Executors.newVirtualThreadPerTaskExecutor()
+```
+
+Each report is submitted as a task:
+
+```java
+List<Future<String>> reports =
+        List.of("Reporte-1", "Reporte-2", "Reporte-3")
+            .stream()
+            .map(name -> executor.submit(
+                () -> service.generateReport(name)
+            ))
+            .toList();
+```
+
+The results are then read with a plain blocking call:
+
+```java
+for (Future<String> report : reports) {
+    System.out.println(report.get());
+}
+```
+
+The executor is opened in a `try-with-resources` block. When the block ends, the executor is closed and **waits for every submitted task to finish**.
+
+### Complete implementation
+
+```java
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class VirtualThreadsSolution {
+
+    static class ReportService {
+
+        public String generateReport(String reportName) {
+            System.out.println("Iniciando " + reportName
+                    + " en " + Thread.currentThread());
+            try {
+                // Simula una operación lenta: llamada externa, archivo, espera, etc.
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return reportName + " completado";
+        }
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ReportService service = new ReportService();
+        long start = System.currentTimeMillis();
+
+        // Un hilo virtual por tarea: son tan baratos que no hace falta pool.
+        // El try-with-resources cierra el executor y espera a que todas las
+        // tareas terminen (concurrencia con ciclo de vida acotado).
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+
+            List<Future<String>> reports = List.of("Reporte-1", "Reporte-2", "Reporte-3")
+                    .stream()
+                    .map(name -> executor.submit(() -> service.generateReport(name)))
+                    .toList();
+
+            // Código de estilo secuencial/bloqueante, pero la espera es barata:
+            // bloquear un hilo virtual no ocupa un hilo del sistema operativo.
+            for (Future<String> report : reports) {
+                System.out.println(report.get());
+            }
+        }
+
+        long end = System.currentTimeMillis();
+        System.out.println("Tiempo total aproximado: " + (end - start) + " ms");
+    }
+
+}
+```
+
+### Execution behavior
+
+Conceptually:
+
+```text
+                 ┌── VirtualThread#1: Reporte-1 ──┐
+Main Thread ─────┼── VirtualThread#2: Reporte-2 ──┼──── get() ──── results
+                 └── VirtualThread#3: Reporte-3 ──┘
+```
+
+Each `Future.get()` call blocks, but blocking a virtual thread is inexpensive: the JVM parks the virtual thread and releases the underlying operating-system thread for other work.
+
+The elapsed time is again approximately one second.
+
+### What changes compared to CompletableFuture
+
+The code reads like the sequential version: submit, then get. There are no callbacks, no `allOf()`, and no composition chain.
+
+The concurrency comes from the runtime, not from the shape of the code.
+
+> Virtual threads make it possible to write simple blocking code that scales like asynchronous code.
+
+## 4. Structured Concurrency Solution
+
+The fourth implementation uses **structured concurrency** through `StructuredTaskScope`.
+
+Structured concurrency treats a group of concurrent tasks as a single unit of work with a well-defined beginning and end: the tasks are started inside a block, and they cannot outlive that block.
+
+The scope is opened with:
+
+```java
+try (var scope = StructuredTaskScope.<String>open()) {
+    ...
+}
+```
+
+Each report is started as a subtask:
+
+```java
+Subtask<String> report1 = scope.fork(() -> service.generateReport("Reporte-1"));
+Subtask<String> report2 = scope.fork(() -> service.generateReport("Reporte-2"));
+Subtask<String> report3 = scope.fork(() -> service.generateReport("Reporte-3"));
+```
+
+The application then waits for the whole group:
+
+```java
+scope.join();
+```
+
+And reads the results:
+
+```java
+System.out.println(report1.get());
+System.out.println(report2.get());
+System.out.println(report3.get());
+```
+
+### Complete implementation
+
+```java
+import java.util.concurrent.StructuredTaskScope;
+import java.util.concurrent.StructuredTaskScope.Subtask;
+
+public class StructuredConcurrencySolution {
+
+    static class ReportService {
+
+        public String generateReport(String reportName) {
+            System.out.println("Iniciando " + reportName
+                    + " en " + Thread.currentThread());
+            try {
+                // Simula una operación lenta: llamada externa, archivo, espera, etc.
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return reportName + " completado";
+        }
+
+    }
+
+    public static void main(String[] args) throws Exception {
+        ReportService service = new ReportService();
+        long start = System.currentTimeMillis();
+
+        // Concurrencia estructurada (API de JDK 25+, preview): las tareas viven
+        // dentro del scope, como variables locales dentro de un bloque.
+        // open() sin argumentos usa la política "todas deben tener éxito":
+        // si una falla, las demás se cancelan y join() lanza la excepción.
+        // Nada puede quedar "huérfano" ejecutándose fuera del try.
+        try (var scope = StructuredTaskScope.<String>open()) {
+
+            Subtask<String> report1 = scope.fork(() -> service.generateReport("Reporte-1"));
+            Subtask<String> report2 = scope.fork(() -> service.generateReport("Reporte-2"));
+            Subtask<String> report3 = scope.fork(() -> service.generateReport("Reporte-3"));
+
+            // Espera a todas y propaga el fallo de la primera que falle.
+            scope.join();
+
+            System.out.println(report1.get());
+            System.out.println(report2.get());
+            System.out.println(report3.get());
+        }
+
+        long end = System.currentTimeMillis();
+        System.out.println("Tiempo total aproximado: " + (end - start) + " ms");
+    }
+
+}
+```
+
+### Execution behavior
+
+Conceptually:
+
+```text
+             open()                              close()
+               │                                    │
+               │   ┌── fork: Reporte-1 ──┐          │
+Main Thread ───┼───┼── fork: Reporte-2 ──┼── join() ┼──── results
+               │   └── fork: Reporte-3 ──┘          │
+               │                                    │
+               └──────── scope lifetime ────────────┘
+```
+
+The three subtasks run concurrently on virtual threads, and the elapsed time is again approximately one second.
+
+### What changes compared to the previous solutions
+
+`StructuredTaskScope.open()` without arguments applies the policy **all subtasks must succeed**:
+
+* If every subtask completes, `join()` returns and the results can be read.
+* If any subtask fails, the remaining subtasks are **cancelled automatically** and `join()` throws the failure.
+
+Neither `CompletableFuture.allOf()` nor the executor-based solution cancels the other tasks when one of them fails.
+
+The `try-with-resources` block guarantees that **no subtask keeps running after the block ends**. Concurrent work therefore has the same lifetime rules as a local variable.
+
+> Structured concurrency makes concurrent code as easy to reason about as sequential code: what starts in a block ends in that block.
+
+### Preview feature note
+
+`StructuredTaskScope` is a **preview API** in current Java releases. Compiling and running it requires:
+
+```text
+--enable-preview
+```
+
+The project's `pom.xml` already applies this flag during compilation.
+
+## Comparing the Four Flavors
+
+| Characteristic              | BlockingProblem     | NonBlockingSolution    | VirtualThreadsSolution              | StructuredConcurrencySolution |
+| --------------------------- | ------------------- | ---------------------- | ----------------------------------- | ----------------------------- |
+| Execution model             | Sequential          | Asynchronous           | Concurrent (blocking style)         | Concurrent (structured)       |
+| Main API                    | Direct method calls | `CompletableFuture`    | `newVirtualThreadPerTaskExecutor()` | `StructuredTaskScope`         |
+| Task creation               | Synchronous calls   | `supplyAsync()`        | `submit()`                          | `fork()`                      |
+| Coordination                | Sequential flow     | `allOf()`              | Executor close                      | `join()`                      |
+| Result retrieval            | Direct return value | `join()`               | `Future.get()`                      | `Subtask.get()`               |
+| Cancels others on failure   | N/A                 | No                     | No                                  | Yes                           |
+| Code style                  | Sequential          | Callback / composition | Sequential                          | Sequential                    |
+| Task lifetime bound to code | N/A                 | No                     | Yes (executor block)                | Yes (scope block)             |
+| Java version                | Any                 | 8+                     | 21+                                 | Preview (`--enable-preview`)  |
+| Approximate elapsed time    | ~3 seconds          | ~1 second              | ~1 second                           | ~1 second                     |
+
 ## Important Technical Note
 
 This project demonstrates **asynchronous task execution**, but the simulated operation itself is still blocking:
@@ -445,33 +715,50 @@ When applying this pattern in larger systems, concurrency must still be controll
 
 The example uses only Java standard-library functionality.
 
-Main API:
+Main APIs:
 
 ```java
 java.util.concurrent.CompletableFuture
+java.util.concurrent.Executors
+java.util.concurrent.StructuredTaskScope
 ```
 
 No external framework, database, HTTP service, or third-party library is required by the example.
 
+The project is built with **Maven** and targets **Java 26**, because `StructuredTaskScope` is a preview API and Java only allows preview features when the source level matches the JDK in use.
+
+The first three classes work on Java 21 or later; only `StructuredConcurrencySolution` requires the preview flag.
+
 ## Running the Project
 
-Compile the classes:
+Compile the project with Maven (requires JDK 26 as `JAVA_HOME`):
 
 ```bash
-javac src/BlockingProblem.java
-javac src/NonBlockingSolution.java
+mvn compile
 ```
 
 Run the blocking example:
 
 ```bash
-java -cp src BlockingProblem
+java -cp target/classes BlockingProblem
 ```
 
 Run the asynchronous example:
 
 ```bash
-java -cp src NonBlockingSolution
+java -cp target/classes NonBlockingSolution
+```
+
+Run the virtual threads example:
+
+```bash
+java -cp target/classes VirtualThreadsSolution
+```
+
+Run the structured concurrency example (preview feature):
+
+```bash
+java --enable-preview -cp target/classes StructuredConcurrencySolution
 ```
 
 ## Expected Result
@@ -496,6 +783,26 @@ Expected elapsed time:
 ≈ 1000 ms
 ```
 
+### Virtual threads version
+
+The three operations run on three virtual threads.
+
+Expected elapsed time:
+
+```text
+≈ 1000 ms
+```
+
+### Structured concurrency version
+
+The three operations run as subtasks of a single scope.
+
+Expected elapsed time:
+
+```text
+≈ 1000 ms
+```
+
 Actual values may vary depending on the machine and runtime environment.
 
 ## Key Concepts
@@ -510,6 +817,11 @@ This project demonstrates:
 * `supplyAsync()`
 * `allOf()`
 * `join()`
+* Virtual threads
+* `newVirtualThreadPerTaskExecutor()`
+* Structured concurrency
+* `StructuredTaskScope`
+* `fork()`
 * Independent tasks
 * Thread utilization
 * Latency reduction
@@ -520,6 +832,8 @@ This project demonstrates:
 > Independent slow tasks do not need to be executed sequentially.
 
 When several operations can execute independently, Java's `CompletableFuture` provides a mechanism for starting them asynchronously and coordinating their results afterward.
+
+Virtual threads make the same concurrency available to plain blocking code, and structured concurrency adds clear lifetime, failure, and cancellation rules on top of it.
 
 The important architectural principle is not simply **“use more threads.”**
 
